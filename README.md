@@ -45,10 +45,11 @@ Each stage has its own **enable** switch, all off on a new node. They run in thi
 ## Install
 
 1. Close Nuke.
-2. Unzip the release and run `install.bat`, or `python install.py`. This copies the plugin to `~/.nuke/plugins/CleanPass` and registers it in `~/.nuke/init.py`. Running it again is safe.
+2. Unzip the release and run `install.bat` (it uses the Python that ships with Nuke). This copies the plugin to `~/.nuke/plugins/CleanPass` and registers it in `~/.nuke/init.py`. Running it again is safe.
+   The [GitHub release](https://github.com/gabinvidal/CleanPass/releases) is complete. The Nukepedia package leaves out the Open Image Denoise runtime (about 45 MB, over the site's upload limit): `install.bat` downloads it from the GitHub release the first time and checks it.
 3. In Nuke the node is under **Filter > CleanPass**, or Tab-search `CleanPass`.
 
-To remove it, run `python uninstall.py`.
+To remove it, run `uninstall.py` (with Nuke's `python.exe` or any Python 3).
 
 ## Build from source
 
@@ -192,10 +193,11 @@ Chaque étape a son interrupteur **enable**, toutes éteintes sur un nouveau nod
 ## Installation
 
 1. Fermer Nuke.
-2. Dézipper la release et lancer `install.bat` (ou `python install.py`). Le plugin est copié dans `~/.nuke/plugins/CleanPass` et déclaré dans `~/.nuke/init.py`. On peut le relancer sans risque.
+2. Dézipper la release et lancer `install.bat` (il utilise le Python fourni avec Nuke). Le plugin est copié dans `~/.nuke/plugins/CleanPass` et déclaré dans `~/.nuke/init.py`. On peut le relancer sans risque.
+   La [release GitHub](https://github.com/gabinvidal/CleanPass/releases) est complète. Le package Nukepedia n'inclut pas le runtime Open Image Denoise (environ 45 Mo, au-delà de la limite du site) : `install.bat` le télécharge depuis la release GitHub la première fois et le vérifie.
 3. Dans Nuke : **Filter > CleanPass**, ou Tab puis `CleanPass`.
 
-Pour désinstaller : `python uninstall.py`. Pour compiler depuis les sources, voir [Build from source](#build-from-source).
+Pour désinstaller : lancer `uninstall.py` (avec le `python.exe` de Nuke ou n'importe quel Python 3). Pour compiler depuis les sources, voir [Build from source](#build-from-source).
 
 ## Utilisation
 
