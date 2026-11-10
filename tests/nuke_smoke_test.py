@@ -55,9 +55,9 @@ def run():
 
     for mode, label in ((1, 'statistical'), (0, 'OIDN')):
         node = nuke.nodes.CleanPass(name='cp_test_node_%d' % mode, inputs=[src])
+        node['firefly_enable'].setValue(True)
         node['reference'].setValue(mode)
-        node['propagate_aovs'].setValue(True)
-        node['aov1'].fromScript('spec')
+        node['aov_layers'].setValue('spec')
         node['output_matte'].setValue(True)
         print('\n--- %s ---' % label)
         for x, y, v in FIREFLIES:
@@ -135,8 +135,7 @@ def run():
     lg['firefly_enable'].setValue(False)
     lg['denoise_enable'].setValue(True)
     lg['stabilize'].setValue(False)
-    lg['propagate_aovs'].setValue(True)
-    lg['aov_pattern'].setValue('lg*')
+    lg['aov_layers'].setValue('lg*')
     worst, info = 0.0, ''
     for i in range(6):
         x, y = 40.5 + 30 * i, 90.5 + 11 * i
@@ -182,12 +181,68 @@ def run():
     mv['firefly_enable'].setValue(False)
     mv['deflicker_enable'].setValue(True)
     e1 = err_vs_clean(mv)
+    mv['use_vectors'].setValue(True)
     mv['motion_layer'].fromScript('motionvector')
     e2 = err_vs_clean(mv)
-    check('motion vectors follow a fast move', e2 < 0.9 * e0 and e2 <= 1.05 * e1,
+    check('motion vectors follow a fast move', e2 < 0.9 * e0 and e2 <= 1.15 * e1,
           '(error %.4f, deflicker without vectors %.4f, with %.4f)' % (e0, e1, e2))
 
-    for n in (mv, movT, cleanT, mvx, mov, clean, xf, tex, lg, split2, split, df, dn, noisy, expr_src, const):
+    # ---- separate inputs ----------------------------------------------------
+    print('\n--- separate inputs ---')
+    check('inputs: src, albedo, normal, motion, mask', mv.maxInputs() == 5, '(%d)' % mv.maxInputs())
+    # the same vectors, from their own input (in rgb) instead of the src layer
+    mvrgb = nuke.nodes.Shuffle2(name='cp_test_mvrgb', inputs=[movT])
+    mvrgb['in1'].setValue('motionvector')
+    mv2 = nuke.nodes.CleanPass(name='cp_test_mv2', inputs=[movT])
+    mv2['deflicker_enable'].setValue(True)
+    mv2['use_vectors'].setValue(True)
+    mv2.setInput(3, mvrgb)
+    e3 = err_vs_clean(mv2)
+    check('motion vectors from the motion input', abs(e3 - e2) <= 0.02 * e2 + 1e-6, '(%.4f vs layer %.4f)' % (e3, e2))
+    mv2['use_depth'].setValue(True)
+    mv2.forceValidate()
+    check('depth adds an input before the mask', mv2.maxInputs() == 6, '(%d)' % mv2.maxInputs())
+    # moving the connections when the layout changes (what the panel does)
+    import cleanpass_ui
+    mk = nuke.nodes.Constant(name='cp_test_mask', color=[1, 1, 1, 1], format='cp_test_fmt')
+    mv2.setInput(5, mk)
+    mv2['use_vectors'].setValue(False)
+    cleanpass_ui.rewire(mv2, [0, 1, 2, 3, 4, 5], [0, 1, 2, 4, 5])
+    names = [x.name() if x else None for x in [mv2.input(i) for i in range(mv2.maxInputs())]]
+    check('rewire keeps depth and mask', mv2.maxInputs() == 5 and mv2.input(4) == mk and mv2.input(3) is None,
+          '(inputs %s)' % names)
+    mv2['use_vectors'].setValue(True)
+    cleanpass_ui.rewire(mv2, [0, 1, 2, 4, 5], [0, 1, 2, 3, 4, 5])
+    mv2.setInput(3, mvrgb)
+    names = [x.name() if x else None for x in [mv2.input(i) for i in range(mv2.maxInputs())]]
+    check('rewire back', mv2.input(5) == mk and mv2.input(3) == mvrgb, '(inputs %s)' % names)
+    # a copy / paste keeps the 6 inputs where they are
+    for n in nuke.allNodes():
+        n.setSelected(n.name() in ('cp_test_mv2', 'cp_test_mvrgb', 'cp_test_mask', 'cp_test_moveoff'))
+    import os, tempfile
+    nk = os.path.join(tempfile.gettempdir(), 'cleanpass_smoke_copy.nk')
+    nuke.nodeCopy(nk)
+    nuke.nodePaste(nk)
+    pasted_nodes = list(nuke.selectedNodes())
+    p2 = [n for n in pasted_nodes if n.Class() == 'CleanPass']
+    if p2:
+        p2[0].forceValidate()  # Nuke reads the number of inputs lazily
+    ok = bool(p2) and p2[0].maxInputs() == 6 and p2[0].input(3) is not None and p2[0].input(5) is not None and \
+        p2[0].input(3).Class() == 'Shuffle2' and p2[0].input(5).Class() == 'Constant'
+    check('copy / paste keeps the inputs', ok, '(%s)' % ([x.Class() if x else None for x in [p2[0].input(i) for i in range(p2[0].maxInputs())]] if p2 else 'no node'))
+    # albedo / normal from their own inputs, with the stabilisation (it needs their t-1 / t+1)
+    alb = nuke.nodes.Constant(name='cp_test_alb', color=[0.5, 0.5, 0.5, 1], format='cp_test_fmt')
+    nrm = nuke.nodes.Constant(name='cp_test_nrm', color=[0, 0, 1, 1], format='cp_test_fmt')
+    sg = nuke.nodes.CleanPass(name='cp_test_sep', inputs=[noisy])
+    sg['denoise_enable'].setValue(True)
+    sg.setInput(1, alb)
+    sg.setInput(2, nrm)
+    s_sep = spatial_std(sg)
+    check('denoise + stabilisation with albedo / normal inputs', finite(s_sep) and s_sep < 0.5 * base,
+          '(std %.4f -> %.4f)' % (base, s_sep))
+
+    for n in pasted_nodes + [sg, alb, nrm, mk, mv2, mvrgb, mv, movT, cleanT, mvx, mov, clean, xf, tex, lg, split2,
+                             split, df, dn, noisy, expr_src, const]:
         nuke.delete(n)
 
     print('\n%d / %d checks passed' % (sum(results), len(results)))

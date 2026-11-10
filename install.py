@@ -12,7 +12,7 @@ import sys
 NAME = 'CleanPass'
 BEGIN = '# --- CleanPass START ---'
 END = '# --- CleanPass END ---'
-KEEP = ('bin', 'oidn', 'icons', 'tests', 'init.py', 'menu.py', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
+KEEP = ('bin', 'oidn', 'icons', 'tests', 'init.py', 'menu.py', 'cleanpass_ui.py', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
 
 
 def nuke_dir():

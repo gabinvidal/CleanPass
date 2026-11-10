@@ -15,6 +15,7 @@
 #include <DDImage/Knobs.h>
 #include <DDImage/PlanarIop.h>
 #include <DDImage/RequestOutput.h>
+#include <DDImage/TableKnobI.h>
 #include <DDImage/Row.h>
 
 #include "cp_lock.h"
@@ -22,6 +23,7 @@
 #include "cp_pipeline.h"
 
 #include <algorithm>
+#include <set>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -47,8 +49,9 @@ const char* const kHelp =
     "albedo / normal guides) and averages it with the samples of the same surface. Removes boiling and "
     "shimmering without ghosting.\n"
     "<b>Denoise</b>: Intel Open Image Denoise, guided by albedo / normal, stabilised over time.\n\n"
-    "Motion vectors, depth and variance passes are used when present (all optional). Light AOVs "
-    "(light groups) can follow every stage and still add up to the beauty.\n\n"
+    "Albedo, normal, motion vectors and depth come from the layers of src, or from their own inputs when "
+    "those are connected (all optional). Light AOVs (light groups) can follow every stage and still add up "
+    "to the beauty.\n\n"
     "Gabin Vidal";
 
 const char* const kReferenceNames[] = {"OIDN (machine learning)", "Statistical (fast)", nullptr};
@@ -161,7 +164,6 @@ enum Pass
     eNormal,
     eMotion,
     eDepth,
-    eVariance,
     ePassCount
 };
 const char* const* passNames(int pass)
@@ -172,8 +174,7 @@ const char* const* passNames(int pass)
     static const char* const motion[] = {"motionvector", "motionvectors", "motion_vector", "motion", "mv",
                                          "velocity", "vel", nullptr};
     static const char* const depth[] = {"depth", "Z", "zdepth", "z_depth", "Pz", nullptr};
-    static const char* const variance[] = {"RGBA_variance", "beauty_variance", "variance", "rgba_var", nullptr};
-    static const char* const* const all[] = {albedo, normal, motion, depth, variance};
+    static const char* const* const all[] = {albedo, normal, motion, depth};
     return all[pass];
 }
 
@@ -198,11 +199,57 @@ std::string findPassLayer(const ChannelSet& chans, int pass)
         for (const std::string& l : layers)
             if (lowerOf(l) == lowerOf(*n))
                 return l;
-    if (pass == eVariance)
-        for (const std::string& l : layers)
-            if (lowerOf(l).find("variance") != std::string::npos)
-                return l;
     return std::string();
+}
+
+// Inputs. Motion vectors and depth only get an input arrow when their option is
+// on (Setup tab); the mask stays last. Node input n is layout()[n].
+enum Slot
+{
+    sSrc,
+    sAlbedo,
+    sNormal,
+    sMotion,
+    sDepth,
+    sMask,
+    sSlotCount
+};
+const char* const kSlotLabel[sSlotCount] = {"src", "albedo", "normal", "motion", "depth", "mask"};
+
+// The pass a guide slot carries.
+int passOfSlot(int slot)
+{
+    switch (slot)
+    {
+    case sAlbedo: return eAlbedo;
+    case sNormal: return eNormal;
+    case sMotion: return eMotion;
+    case sDepth: return eDepth;
+    default: return -1;
+    }
+}
+
+// Layers that are data, not light: never offered as AOVs.
+bool isDataLayer(const std::string& layer)
+{
+    const std::string l = lowerOf(layer);
+    for (int p = 0; p < ePassCount; ++p)
+        for (const char* const* n = passNames(p); *n; ++n)
+            if (l == lowerOf(*n))
+                return true;
+    static const char* const prefixes[] = {"crypto", "p", "pref", "pworld", "uv", "st", "id", "variance", "firefly",
+                                           "depth", "deep", "mask", "matte", "position", "normal", "albedo",
+                                           "motion", "velocity", "opacity", "alpha", "other", nullptr};
+    for (const char* const* q = prefixes; *q; ++q)
+    {
+        const size_t n = std::strlen(*q);
+        // the whole name, or a prefix followed by '_' / digits (crypto*, id1, P_world...)
+        if (l == *q || (n > 1 && l.compare(0, n, *q) == 0 && (l.size() == n || l[n] == '_' || std::isdigit((unsigned char)l[n]))))
+            return true;
+    }
+    if (l.find("variance") != std::string::npos || l.find("crypto") != std::string::npos)
+        return true;
+    return false;
 }
 
 // Shell-style wildcard match (* and ?), case-insensitive.
@@ -232,8 +279,9 @@ class CleanPassIop : public PlanarIop
 public:
     explicit CleanPassIop(Node* node);
 
-    int minimum_inputs() const override { return 1; }
-    int maximum_inputs() const override { return 4; }
+    int minimum_inputs() const override { return (int)layout().size(); }
+    int maximum_inputs() const override { return (int)layout().size(); }
+    int optional_input() const override { return 1; } // every input but src may stay unconnected
     const char* input_label(int n, char*) const override;
     int split_input(int n) const override;
     const OutputContext& inputContext(int n, int offset, OutputContext& ctx) const override;
@@ -255,7 +303,7 @@ public:
 
 private:
     // ---- knobs: Firefly ----
-    bool m_ffOn = true;
+    bool m_ffOn = false;
     int m_reference = 0;
     float m_threshold, m_softness, m_isolation, m_adaptivity, m_minLevel;
     int m_size, m_grow;
@@ -272,7 +320,6 @@ private:
     int m_dfSearch, m_dfPatch;
     float m_dfTolerance, m_dfAmount;
     bool m_dfGuides;
-    bool m_dfVectors = true, m_dfDepth = true, m_dfVariance = true;
 
     // ---- knobs: Denoise ----
     bool m_dnOn = false;
@@ -286,10 +333,9 @@ private:
 
     // ---- knobs: Setup ----
     ChannelSet m_beautyLayer, m_albedoLayer, m_normalLayer;
-    ChannelSet m_motionLayer, m_depthLayer, m_varianceLayer;
-    bool m_propagate = false;
-    ChannelSet m_aovLayer[4];
-    const char* m_aovPattern = nullptr;
+    ChannelSet m_motionLayer, m_depthLayer;
+    bool m_useVectors = false, m_useDepth = false; // also add the motion / depth inputs
+    const char* m_aovList = nullptr; // checked AOV layers, space separated (the table is its editor)
     int m_view = eResult;
     bool m_outputMatte = false;
     Channel m_matteChannel;
@@ -304,12 +350,14 @@ private:
     struct Config
     {
         Rgb beauty, albedo, normal;
-        Rgb motion, depth, variance; // optional passes of src (invalid = not used)
+        Rgb motion, depth; // optional passes (invalid = not used)
+        // where each guide comes from: sSrc (a layer of src) or its own input slot
+        int albedoFrom = sSrc, normalFrom = sSrc, motionFrom = sSrc, depthFrom = sSrc;
         std::vector<Rgb> aovs;
         Box box; // processed area: bbox inside the format
         cleanpass::PipelineParams pipe;
         cleanpass::OidnSettings oidn;
-        bool albedoInput = false, normalInput = false, maskInput = false;
+        bool maskInput = false;
         Channel maskChannel = Chan_Black;
         bool invertMask = false;
         int view = eResult;
@@ -355,12 +403,19 @@ private:
     void denoisedPut(const Hash& k, std::shared_ptr<const cleanpass::PipelineResult> r, bool replace = false);
     void computeAovs(const Config& cfg, Result& res);
     void autoLayers(bool all);
+    void refreshAovTable();
+    void storeAovTable();
+    std::vector<int> m_appliedLayout; // the input layout the node's arrows were last wired for
+    bool m_fillingTable = false;
 
     // ---- helpers ----
+    std::vector<int> layout() const;
+    int indexOf(int slot) const;
     int temporalRadius() const;
-    int actualCopies() const;
-    Iop* in(int n, int offset = 0) const;
-    bool connected(int n) const;
+    int copiesOf(int n) const;
+    Iop* in(int slot, int offset = 0) const;
+    bool connected(int slot) const;
+    Iop* passIop(int from, int offset) const { return in(from, offset); }
     Hash analysisKey(const Config& cfg) const;
     Hash settingsKey(const Config& cfg) const; // the settings only (no frame, no input)
     std::shared_ptr<Result> analysis(const Config& cfg);
@@ -401,16 +456,30 @@ CleanPassIop::CleanPassIop(Node* node) : PlanarIop(node)
     m_matteChannel = getChannel("firefly.matte");
 }
 
+std::vector<int> CleanPassIop::layout() const
+{
+    std::vector<int> l = {sSrc, sAlbedo, sNormal};
+    if (m_useVectors)
+        l.push_back(sMotion);
+    if (m_useDepth)
+        l.push_back(sDepth);
+    l.push_back(sMask);
+    return l;
+}
+
+int CleanPassIop::indexOf(int slot) const
+{
+    const std::vector<int> l = layout();
+    for (size_t i = 0; i < l.size(); ++i)
+        if (l[i] == slot)
+            return (int)i;
+    return -1;
+}
+
 const char* CleanPassIop::input_label(int n, char*) const
 {
-    switch (n)
-    {
-    case 0: return "src";
-    case 1: return "albedo";
-    case 2: return "normal";
-    case 3: return "mask";
-    default: return nullptr;
-    }
+    const std::vector<int> l = layout();
+    return (n >= 0 && n < (int)l.size()) ? kSlotLabel[l[n]] : nullptr;
 }
 
 int CleanPassIop::temporalRadius() const
@@ -425,37 +494,39 @@ int CleanPassIop::temporalRadius() const
     return r;
 }
 
-int CleanPassIop::split_input(int n) const
+int CleanPassIop::split_input(int) const
 {
-    // Input 0 is always split in 5 (t, t-1, t+1, t-2, t+2). Nuke calls this while
+    // Every input is split in 5 (t, t-1, t+1, t-2, t+2): the guides of the
+    // neighbour frames can come from their own inputs too. Nuke calls this while
     // rebuilding the tree, before a changed knob is stored, so a split that
     // depends on the knobs would lag one change behind. Only the copies the
     // enabled stages need are requested (see getRequests), so unused ones cost
     // nothing.
-    return n == 0 ? 5 : 1;
+    return 5;
 }
 
-const OutputContext& CleanPassIop::inputContext(int n, int offset, OutputContext& ctx) const
+const OutputContext& CleanPassIop::inputContext(int, int offset, OutputContext& ctx) const
 {
     ctx = outputContext();
-    if (n == 0 && offset > 0)
+    if (offset > 0)
         ctx.setFrame(outputContext().frame() + offsetOfCopy(offset));
     return ctx;
 }
 
-int CleanPassIop::actualCopies() const
+int CleanPassIop::copiesOf(int n) const
 {
-    // copies of input 0 that exist (always 5 once the tree is built, see split_input)
-    return std::max(1, std::min(5, inputs() - (node_inputs() - 1)));
+    // copies of node input n that exist (5 once the tree is built, see split_input)
+    if (n < 0 || n >= node_inputs())
+        return 0;
+    const int first = inputNumber(n, 0);
+    const int next = (n + 1 < node_inputs()) ? inputNumber(n + 1, 0) : inputs();
+    return std::max(0, std::min(5, next - first));
 }
 
-Iop* CleanPassIop::in(int n, int offset) const
+Iop* CleanPassIop::in(int slot, int offset) const
 {
-    if (n < 0 || n >= node_inputs())
-        return nullptr;
-    if (n == 0 && offset >= actualCopies())
-        return nullptr;
-    if (n != 0 && offset != 0)
+    const int n = indexOf(slot);
+    if (n < 0 || n >= node_inputs() || offset < 0 || offset >= copiesOf(n))
         return nullptr;
     const int idx = inputNumber(n, offset);
     if (idx < 0 || idx >= inputs())
@@ -463,9 +534,10 @@ Iop* CleanPassIop::in(int n, int offset) const
     return dynamic_cast<Iop*>(input(idx));
 }
 
-bool CleanPassIop::connected(int n) const
+bool CleanPassIop::connected(int slot) const
 {
-    return n < node_inputs() && node_input(n, Op::OUTPUT_OP) != nullptr;
+    const int n = indexOf(slot);
+    return n >= 0 && n < node_inputs() && node_input(n, Op::OUTPUT_OP) != nullptr;
 }
 
 // ===========================================================================
@@ -474,6 +546,96 @@ bool CleanPassIop::connected(int n) const
 
 void CleanPassIop::knobs(Knob_Callback f)
 {
+    // ------------------------------------------------------------ Setup
+    Tab_knob(f, "Setup");
+    Divider(f, "Passes");
+    Input_ChannelSet_knob(f, &m_beautyLayer, 0, "beauty_layer", "beauty");
+    Tooltip(f, "Layer to clean. It is corrected in place; every other layer passes through.");
+    Input_ChannelSet_knob(f, &m_albedoLayer, 0, "albedo_layer", "albedo");
+    Tooltip(f, "Albedo / diffuse colour layer of src (empty = found by name). When the albedo input is "
+               "connected, it is read from there instead. Used by all three stages.");
+    Input_ChannelSet_knob(f, &m_normalLayer, 0, "normal_layer", "normal");
+    Tooltip(f, "Normal layer of src (empty = found by name). When the normal input is connected, it is read "
+               "from there instead.");
+    Bool_knob(f, &m_useVectors, "use_vectors", "motion vectors");
+    SetFlags(f, Knob::STARTLINE);
+    Tooltip(f, "Use the renderer's motion vectors (Deflicker and 'stabilise over time'). They come from the "
+               "motion input when it is connected (it appears when this is on), else from the layer on the "
+               "right. Their convention (pixels or NDC, forward or backward, y up or down, full or half frame) "
+               "is found automatically by checking them against the image, and each pixel keeps the image's own "
+               "match where the vectors do not fit (reflections, refraction, transparency).");
+    Input_ChannelSet_knob(f, &m_motionLayer, 0, "motion_layer", "");
+    ClearFlags(f, Knob::STARTLINE);
+    Tooltip(f, "Motion vector layer of src (x in red, y in green; empty = found by name, e.g. motionvector).");
+    Bool_knob(f, &m_useDepth, "use_depth", "depth");
+    SetFlags(f, Knob::STARTLINE);
+    Tooltip(f, "Use the depth pass to reject samples that come from another object (Deflicker and "
+               "'stabilise over time'). From the depth input when it is connected (it appears when this is on), "
+               "else from the layer on the right.");
+    Input_ChannelSet_knob(f, &m_depthLayer, 0, "depth_layer", "");
+    ClearFlags(f, Knob::STARTLINE);
+    Tooltip(f, "Depth layer of src (empty = found by name, e.g. depth / Z).");
+    Button(f, "detect_layers", "detect layers");
+    SetFlags(f, Knob::STARTLINE);
+    Tooltip(f, "Fill the layers above from the usual names (albedo, N, motionvector, depth / Z...). An empty "
+               "layer is found by these names anyway; set a layer by hand to use another one.");
+
+    Divider(f, "AOVs");
+    Knob* table = Table_knob(f, "aov_table", "AOVs");
+    if (f.makeKnobs() && table)
+        if (Table_KnobI* tk = table->tableKnob())
+        {
+            tk->addColumn("use", "clean", Table_KnobI::BoolColumn, true, 50);
+            tk->addStringColumn("layer", "layer", false, 260);
+            tk->setEditingWidgets(false);
+        }
+    SetFlags(f, Knob::DO_NOT_WRITE | Knob::NO_UNDO);
+    Tooltip(f, "The layers of src. Check the light AOVs (light groups, diffuse, specular...) that should follow "
+               "every stage, so that they still add up to the cleaned beauty. Data passes are not listed.\n"
+               "Select several layers with Shift / Ctrl, then tick one of them (or use the buttons below): "
+               "they all follow.");
+    Button(f, "aov_check", "check selected");
+    SetFlags(f, Knob::STARTLINE);
+    Tooltip(f, "Check every selected layer of the list (select with Shift / Ctrl).");
+    Button(f, "aov_uncheck", "uncheck selected");
+    Tooltip(f, "Uncheck every selected layer of the list.");
+    Button(f, "aov_all", "all");
+    Tooltip(f, "Check every layer of the list.");
+    Button(f, "aov_none", "none");
+    Tooltip(f, "Uncheck every layer of the list.");
+    String_knob(f, &m_aovList, "aov_layers", INVISIBLE);
+    Tooltip(f, "The checked AOV layers, separated by spaces (wildcards work, e.g. RGBA_*). Set by the table.");
+
+    Divider(f, "Output");
+    Enumeration_knob(f, &m_view, kViewNames, "view", "view");
+    Tooltip(f, "Result: the cleaned image.\nFireflies overlay: detections in magenta over the darkened image.\n"
+               "Removed: what all the stages took out.\nFirefly matte: the detections.\n"
+               "Deflicker weight: how much each pixel was averaged over time (white = fully).");
+    Bool_knob(f, &m_outputMatte, "output_matte", "output matte");
+    SetFlags(f, Knob::STARTLINE);
+    Tooltip(f, "Write the firefly matte into the channel on the right.");
+    Channel_knob(f, &m_matteChannel, 1, "matte_channel", "");
+    ClearFlags(f, Knob::STARTLINE);
+    Channel_knob(f, &m_maskChannel, 1, "mask_channel", "mask");
+    SetFlags(f, Knob::STARTLINE);
+    Tooltip(f, "Channel of the mask input that limits the whole effect.");
+    Bool_knob(f, &m_invertMask, "invert_mask", "invert");
+    ClearFlags(f, Knob::STARTLINE);
+    Float_knob(f, &m_mix, "mix", "mix");
+    SetRange(f, 0.0, 1.0);
+    SetFlags(f, Knob::STARTLINE);
+
+    Divider(f, "OIDN");
+    Enumeration_knob(f, &m_device, kDeviceNames, "device", "device");
+    Tooltip(f, "Device used by OIDN. CUDA falls back to CPU when unavailable.");
+    Int_knob(f, &m_maxMem, "max_memory", "memory limit (MB)");
+    Tooltip(f, "Cap the memory used by OIDN. 0 = no limit.");
+
+    Divider(f, "");
+    Text_knob(f, "<b>CleanPass</b> " CP_VERSION " - Gabin Vidal\n"
+                 "Uses Intel Open Image Denoise (Apache 2.0).");
+
+
     // ------------------------------------------------------------ Firefly
     Tab_knob(f, "Firefly");
     Bool_knob(f, &m_ffOn, "firefly_enable", "enable");
@@ -580,22 +742,9 @@ void CleanPassIop::knobs(Knob_Callback f)
     Tooltip(f, "Radius of the patches compared to find the motion.");
     Bool_knob(f, &m_dfGuides, "df_guides", "use albedo / normal for the motion");
     SetFlags(f, Knob::STARTLINE);
-    Tooltip(f, "The guides are noise free: they make the matching much more reliable. They are read from "
-               "the src layers set in the Setup tab (not from the separate albedo / normal inputs).");
-    Divider(f, "Optional passes (set in the Setup tab)");
-    Bool_knob(f, &m_dfVectors, "df_vectors", "motion vectors");
+    Tooltip(f, "The guides are noise free: they make the matching much more reliable.");
+    Text_knob(f, "<font color=#888>Motion vectors and depth: Setup tab.</font>");
     SetFlags(f, Knob::STARTLINE);
-    Tooltip(f, "Use the renderer's motion vectors. Their convention (pixels or NDC, forward or backward, "
-               "y up or down) is found automatically by checking them against the image. Each pixel still "
-               "keeps the image's own match where the vectors do not fit (reflections, refraction, "
-               "transparency). Without vectors the motion is estimated from the image.");
-    Bool_knob(f, &m_dfDepth, "df_depth", "depth");
-    ClearFlags(f, Knob::STARTLINE);
-    Tooltip(f, "Use the depth pass to reject samples that come from another object (disocclusions).");
-    Bool_knob(f, &m_dfVariance, "df_variance", "variance");
-    ClearFlags(f, Knob::STARTLINE);
-    Tooltip(f, "Use a variance pass (e.g. Arnold's AOV variance) for an exact per-pixel noise level, "
-               "instead of an estimate.");
 
     // ------------------------------------------------------------ Denoise
     Tab_knob(f, "Denoise");
@@ -628,7 +777,7 @@ void CleanPassIop::knobs(Knob_Callback f)
     Divider(f, "AOVs");
     Bool_knob(f, &m_denoiseAovs, "denoise_aovs", "denoise the AOVs");
     SetFlags(f, Knob::STARTLINE);
-    Tooltip(f, "Also denoise the AOVs set in the Setup tab (propagate to AOVs), with the same guides.");
+    Tooltip(f, "Also denoise the AOVs checked in the Setup tab, with the same guides.");
     Bool_knob(f, &m_aovsMatch, "aovs_match_beauty", "keep their sum = beauty");
     ClearFlags(f, Knob::STARTLINE);
     Tooltip(f, "When the AOVs add up to the beauty (a complete set of light groups, checked on the image), "
@@ -636,73 +785,6 @@ void CleanPassIop::knobs(Knob_Callback f)
     Text_knob(f, "\nTip: OIDN expects uncorrelated pixel noise. Renders made with a wide pixel\n"
                  "filter denoise less well than with a box / 1 px filter.");
 
-    // ------------------------------------------------------------ Setup
-    Tab_knob(f, "Setup");
-    Divider(f, "Layers");
-    Input_ChannelSet_knob(f, &m_beautyLayer, 0, "beauty_layer", "beauty");
-    Tooltip(f, "Layer to clean. It is corrected in place; every other layer passes through.");
-    Input_ChannelSet_knob(f, &m_albedoLayer, 0, "albedo_layer", "albedo");
-    Tooltip(f, "Albedo / diffuse colour pass from the src input. Ignored when the albedo input is connected. "
-               "Used by all three stages.");
-    Input_ChannelSet_knob(f, &m_normalLayer, 0, "normal_layer", "normal");
-    Tooltip(f, "Normal pass from the src input. Ignored when the normal input is connected.");
-    Input_ChannelSet_knob(f, &m_motionLayer, 0, "motion_layer", "motion vectors");
-    Tooltip(f, "Optional: renderer motion vectors (x in red, y in green), e.g. Arnold's motionvector. "
-               "Any common convention works.");
-    Input_ChannelSet_knob(f, &m_depthLayer, 0, "depth_layer", "depth");
-    Tooltip(f, "Optional: depth pass (Z).");
-    Input_ChannelSet_knob(f, &m_varianceLayer, 0, "variance_layer", "variance");
-    Tooltip(f, "Optional: variance of the beauty.");
-    Button(f, "detect_layers", "detect layers");
-    SetFlags(f, Knob::STARTLINE);
-    Tooltip(f, "Fill the layers above from the usual names (albedo, N, motionvector, depth / Z, variance...). "
-               "An empty layer is found by these names anyway; set a layer by hand to use another one.");
-
-    Divider(f, "AOVs");
-    Bool_knob(f, &m_propagate, "propagate_aovs", "propagate to AOVs");
-    SetFlags(f, Knob::STARTLINE);
-    Tooltip(f, "Apply the corrections to the light AOVs below, so that they still add up to the corrected "
-               "beauty. Pick additive light passes only (diffuse, specular, light groups...), not data "
-               "passes. The Denoise tab decides whether they are denoised too.");
-    for (int i = 0; i < 4; ++i)
-    {
-        static const char* names[] = {"aov1", "aov2", "aov3", "aov4"};
-        Input_ChannelSet_knob(f, &m_aovLayer[i], 0, names[i], i == 0 ? "AOVs" : "");
-        if (i == 1 || i == 3)
-            ClearFlags(f, Knob::STARTLINE);
-    }
-    String_knob(f, &m_aovPattern, "aov_pattern", "more AOVs");
-    Tooltip(f, "More AOV layers by name, separated by spaces. Wildcards work: RGBA_* takes every Arnold "
-               "light group, diffuse_* every diffuse pass.");
-
-    Divider(f, "Output");
-    Enumeration_knob(f, &m_view, kViewNames, "view", "view");
-    Tooltip(f, "Result: the cleaned image.\nFireflies overlay: detections in magenta over the darkened image.\n"
-               "Removed: what all the stages took out.\nFirefly matte: the detections.\n"
-               "Deflicker weight: how much each pixel was averaged over time (white = fully).");
-    Bool_knob(f, &m_outputMatte, "output_matte", "output matte");
-    SetFlags(f, Knob::STARTLINE);
-    Tooltip(f, "Write the firefly matte into the channel on the right.");
-    Channel_knob(f, &m_matteChannel, 1, "matte_channel", "");
-    ClearFlags(f, Knob::STARTLINE);
-    Input_Channel_knob(f, &m_maskChannel, 1, 3, "mask_channel", "mask");
-    SetFlags(f, Knob::STARTLINE);
-    Tooltip(f, "Channel of the mask input that limits the whole effect.");
-    Bool_knob(f, &m_invertMask, "invert_mask", "invert");
-    ClearFlags(f, Knob::STARTLINE);
-    Float_knob(f, &m_mix, "mix", "mix");
-    SetRange(f, 0.0, 1.0);
-    SetFlags(f, Knob::STARTLINE);
-
-    Divider(f, "OIDN");
-    Enumeration_knob(f, &m_device, kDeviceNames, "device", "device");
-    Tooltip(f, "Device used by OIDN. CUDA falls back to CPU when unavailable.");
-    Int_knob(f, &m_maxMem, "max_memory", "memory limit (MB)");
-    Tooltip(f, "Cap the memory used by OIDN. 0 = no limit.");
-
-    Divider(f, "");
-    Text_knob(f, "<b>CleanPass</b> " CP_VERSION " - Gabin Vidal\n"
-                 "Uses Intel Open Image Denoise (Apache 2.0).");
 }
 
 void CleanPassIop::updateKnobStates()
@@ -719,23 +801,113 @@ void CleanPassIop::updateKnobStates()
     en("energy_amount", m_ffOn && m_conserve);
     for (const char* n : {"df_frames", "df_amount", "df_tolerance", "df_search", "df_patch"})
         en(n, m_dfOn);
-    for (const char* n : {"df_guides", "df_vectors", "df_depth", "df_variance"})
-        en(n, m_dfOn || (m_dnOn && m_stabilize));
+    // motion vectors and depth serve the deflicker and the stabilisation only
+    const bool temporalMotion = m_dfOn || (m_dnOn && m_stabilize);
+    en("df_guides", temporalMotion);
+    en("use_vectors", temporalMotion);
+    en("use_depth", temporalMotion);
+    en("motion_layer", temporalMotion && m_useVectors && !connected(sMotion));
+    en("depth_layer", temporalMotion && m_useDepth && !connected(sDepth));
     for (const char* n : {"denoise_amount", "stabilize"})
         en(n, m_dnOn);
     en("stabilize_tolerance", m_dnOn && m_stabilize);
-    en("denoise_aovs", m_dnOn && m_propagate);
-    en("aovs_match_beauty", m_dnOn && m_propagate && m_denoiseAovs);
-    en("aov_pattern", m_propagate);
+    const bool anyAov = m_aovList && *m_aovList;
+    en("denoise_aovs", m_dnOn && anyAov);
+    en("aovs_match_beauty", m_dnOn && anyAov && m_denoiseAovs);
     en("quality", m_dnOn || (m_ffOn && m_reference == 0));
     en("prefilter_aux", m_dnOn || (m_ffOn && m_reference == 0));
-    for (const char* n : {"aov1", "aov2", "aov3", "aov4"})
-        en(n, m_propagate);
     en("matte_channel", m_outputMatte);
-    en("albedo_layer", !connected(1));
-    en("normal_layer", !connected(2));
-    en("mask_channel", connected(3));
-    en("invert_mask", connected(3));
+    en("albedo_layer", !connected(sAlbedo));
+    en("normal_layer", !connected(sNormal));
+    en("mask_channel", connected(sMask));
+    en("invert_mask", connected(sMask));
+}
+
+// Lists the layers of src in the AOV table (data passes and the guides left
+// out), keeping the checked ones checked. Called when the panel opens or the
+// input changes.
+void CleanPassIop::refreshAovTable()
+{
+    Knob* k = knob("aov_table");
+    Table_KnobI* tk = k ? k->tableKnob() : nullptr;
+    if (!tk)
+        return;
+    Op* op = node_input(0, Op::OUTPUT_OP);
+    Iop* src = op ? dynamic_cast<Iop*>(op) : nullptr;
+    std::vector<std::string> layers;
+    if (src)
+    {
+        src->validate(false);
+        const ChannelSet chans = src->info().channels();
+        std::vector<std::string> skip;
+        foreach (z, m_beautyLayer)
+            skip.push_back(getLayerName(z));
+        for (const ChannelSet* cs : {&m_albedoLayer, &m_normalLayer, &m_motionLayer, &m_depthLayer})
+        {
+            const ChannelSet& guide = *cs;
+            foreach (z, guide)
+                skip.push_back(getLayerName(z));
+        }
+        foreach (z, chans)
+        {
+            const std::string l = getLayerName(z);
+            if (colourIndex(z) > 2 || isDataLayer(l) || std::find(skip.begin(), skip.end(), l) != skip.end() ||
+                std::find(layers.begin(), layers.end(), l) != layers.end())
+                continue;
+            layers.push_back(l);
+        }
+    }
+    // checked: the names (or wildcards) stored in aov_layers
+    std::vector<std::string> checked;
+    {
+        std::string cur;
+        for (const char* c = m_aovList ? m_aovList : "";; ++c)
+        {
+            if (!*c || std::isspace((unsigned char)*c) || *c == ',')
+            {
+                if (!cur.empty())
+                    checked.push_back(cur);
+                cur.clear();
+                if (!*c)
+                    break;
+            }
+            else
+                cur += *c;
+        }
+    }
+    // keep a checked layer listed even when src does not have it right now
+    for (const std::string& c : checked)
+        if (c.find_first_of("*?") == std::string::npos && std::find(layers.begin(), layers.end(), c) == layers.end())
+            layers.push_back(c);
+    m_fillingTable = true;
+    tk->deleteAllItemsNoChanged();
+    for (const std::string& l : layers)
+    {
+        const int row = tk->addRow();
+        bool on = false;
+        for (const std::string& c : checked)
+            on = on || globMatch(c.c_str(), l.c_str());
+        tk->setCellBool(row, 0, on);
+        tk->setCellString(row, 1, l);
+    }
+    tk->realKnob()->changed();
+    m_fillingTable = false;
+}
+
+// The table was edited: store the checked layers in aov_layers.
+void CleanPassIop::storeAovTable()
+{
+    Knob* k = knob("aov_table");
+    Table_KnobI* tk = k ? k->tableKnob() : nullptr;
+    if (!tk)
+        return;
+    std::string list;
+    for (int r = 0; r < tk->getRowCount(); ++r)
+        if (tk->getCellBool(r, 0))
+            list += (list.empty() ? "" : " ") + tk->getCellString(r, 1);
+    if (Knob* s = knob("aov_layers"))
+        if (list != (m_aovList ? std::string(m_aovList) : std::string()))
+            s->set_text(list.c_str());
 }
 
 // Fills the layer knobs from the usual names (all = also the ones already set).
@@ -747,10 +919,8 @@ void CleanPassIop::autoLayers(bool all)
         return;
     src->validate(false);
     const ChannelSet chans = src->info().channels();
-    const char* const knobs[ePassCount] = {"albedo_layer", "normal_layer", "motion_layer", "depth_layer",
-                                           "variance_layer"};
-    const ChannelSet* values[ePassCount] = {&m_albedoLayer, &m_normalLayer, &m_motionLayer, &m_depthLayer,
-                                            &m_varianceLayer};
+    const char* const knobs[ePassCount] = {"albedo_layer", "normal_layer", "motion_layer", "depth_layer"};
+    const ChannelSet* values[ePassCount] = {&m_albedoLayer, &m_normalLayer, &m_motionLayer, &m_depthLayer};
     for (int p = 0; p < ePassCount; ++p)
     {
         const std::string layer = findPassLayer(chans, p);
@@ -762,15 +932,95 @@ void CleanPassIop::autoLayers(bool all)
 
 int CleanPassIop::knob_changed(Knob* k)
 {
+    if (k == &Knob::showPanel)
+        m_appliedLayout = layout();
+    if (k->is("use_vectors") || k->is("use_depth"))
+    {
+        // the motion / depth inputs come and go: move the existing connections
+        // (mask included, which stays last) to their new input numbers
+        const std::vector<int> now = layout();
+        if (!m_appliedLayout.empty() && now != m_appliedLayout)
+        {
+            auto list = [](const std::vector<int>& l) {
+                std::string t = "[";
+                for (size_t i = 0; i < l.size(); ++i)
+                    t += (i ? "," : "") + std::to_string(l[i]);
+                return t + "]";
+            };
+            const std::string cmd = "import cleanpass_ui\ncleanpass_ui.rewire(nuke.toNode('" + node_name() + "'), " +
+                                    list(m_appliedLayout) + ", " + list(now) + ")";
+            script_command(cmd.c_str(), true, false);
+            script_unlock();
+        }
+        m_appliedLayout = now;
+        updateKnobStates();
+        return 1;
+    }
     if (k->is("detect_layers"))
     {
         autoLayers(true);
+        refreshAovTable();
+        return 1;
+    }
+    if (k->is("aov_table") || k->is("aov_check") || k->is("aov_uncheck") || k->is("aov_all") || k->is("aov_none"))
+    {
+        if (m_fillingTable)
+            return 1;
+        Knob* tk0 = knob("aov_table");
+        Table_KnobI* tk = tk0 ? tk0->tableKnob() : nullptr;
+        if (!tk)
+            return 1;
+        std::vector<int> rows;
+        bool value = true;
+        if (k->is("aov_table"))
+        {
+            // a box ticked in a multi-selection: every selected row follows it
+            const std::set<std::pair<int, int>> cells = tk->getModifiedCells();
+            if (tk->getModificationType() == Table_KnobI::eEditRow && cells.size() == 1 && cells.begin()->second == 0)
+            {
+                const int r = cells.begin()->first;
+                const std::vector<int> sel = tk->getSelectedRows();
+                if (sel.size() > 1 && std::find(sel.begin(), sel.end(), r) != sel.end())
+                {
+                    rows = sel;
+                    value = tk->getCellBool(r, 0);
+                }
+            }
+        }
+        else if (k->is("aov_check") || k->is("aov_uncheck"))
+        {
+            rows = tk->getSelectedRows();
+            value = k->is("aov_check");
+        }
+        else
+        {
+            for (int r = 0; r < tk->getRowCount(); ++r)
+                rows.push_back(r);
+            value = k->is("aov_all");
+        }
+        if (!rows.empty())
+        {
+            m_fillingTable = true;
+            for (int r : rows)
+                if (r >= 0 && r < tk->getRowCount())
+                    tk->setCellBool(r, 0, value);
+            tk->realKnob()->changed();
+            m_fillingTable = false;
+        }
+        storeAovTable();
+        updateKnobStates();
         return 1;
     }
     if (k->is("inputChange") || k == &Knob::showPanel)
+    {
         autoLayers(false);
+        refreshAovTable();
+    }
+    if (k->is("beauty_layer") || k->is("albedo_layer") || k->is("normal_layer") || k->is("motion_layer") ||
+        k->is("depth_layer"))
+        refreshAovTable();
     if (k == &Knob::showPanel || k->is("inputChange") || k->is("firefly_enable") || k->is("deflicker_enable") ||
-        k->is("denoise_enable") || k->is("conserve_energy") || k->is("propagate_aovs") || k->is("temporal") ||
+        k->is("denoise_enable") || k->is("conserve_energy") || k->is("aov_layers") || k->is("temporal") ||
         k->is("output_matte") || k->is("reference") || k->is("stabilize") || k->is("denoise_aovs"))
     {
         updateKnobStates();
@@ -794,13 +1044,12 @@ void CleanPassIop::_validate(bool for_real)
     copy_info(); // from input 0 at the current frame
 
     // the other inputs and frames are read in renderStripe: validate them now
-    for (int n = 1; n < 4; ++n)
-        if (connected(n))
-            if (Iop* i = in(n))
-                i->validate(for_real);
-    for (int o = 1; o < std::min(actualCopies(), 1 + 2 * temporalRadius()); ++o)
-        if (Iop* t = in(0, o))
-            t->validate(for_real);
+    const int maxCopies = 1 + 2 * temporalRadius();
+    for (int slot = 0; slot < sSlotCount; ++slot)
+        if (connected(slot))
+            for (int o = 0; o < (slot == sMask ? 1 : maxCopies); ++o)
+                if (Iop* i = in(slot, o))
+                    i->validate(for_real);
 
     m_size = std::max(1, std::min(3, m_size));
     m_grow = std::max(0, std::min(3, m_grow));
@@ -813,9 +1062,7 @@ void CleanPassIop::_validate(bool for_real)
     Iop* src = in(0);
     const ChannelSet srcChans = src ? src->info().channels() : ChannelSet();
 
-    cfg->albedoInput = connected(1);
-    cfg->normalInput = connected(2);
-    cfg->maskInput = connected(3) && m_maskChannel != Chan_Black;
+    cfg->maskInput = connected(sMask) && m_maskChannel != Chan_Black;
     cfg->beauty = rgbOf(m_beautyLayer);
     // an empty layer knob means: the layer with the usual name, if src has one
     auto present = [&](const ChannelSet& cs, int pass) {
@@ -833,23 +1080,51 @@ void CleanPassIop::_validate(bool for_real)
         }
         return rgbOf(r);
     };
-    cfg->albedo = cfg->albedoInput ? rgbOf(Mask_RGB) : present(m_albedoLayer, eAlbedo);
-    cfg->normal = cfg->normalInput ? rgbOf(Mask_RGB) : present(m_normalLayer, eNormal);
-    cfg->motion = present(m_motionLayer, eMotion);
-    cfg->depth = present(m_depthLayer, eDepth);
-    cfg->variance = present(m_varianceLayer, eVariance);
+    // a connected input wins over the layer of src: its layer with the usual
+    // name if it has one (a multi-layer Read), else its rgb
+    auto fromInput = [&](int slot) {
+        Iop* i = in(slot);
+        if (!i)
+            return Rgb();
+        const ChannelSet chans = i->info().channels();
+        const std::string layer = findPassLayer(chans, passOfSlot(slot));
+        ChannelSet r;
+        foreach (z, chans)
+            if (layer.empty() ? (z == Chan_Red || z == Chan_Green || z == Chan_Blue) : getLayerName(z) == layer)
+                r += z;
+        return rgbOf(r);
+    };
+    auto pick = [&](int slot, const ChannelSet& layer, Rgb& out, int& from) {
+        if (connected(slot))
+        {
+            out = fromInput(slot);
+            from = slot;
+        }
+        else
+        {
+            out = present(layer, passOfSlot(slot));
+            from = sSrc;
+        }
+    };
+    pick(sAlbedo, m_albedoLayer, cfg->albedo, cfg->albedoFrom);
+    pick(sNormal, m_normalLayer, cfg->normal, cfg->normalFrom);
+    if (m_useVectors)
+        pick(sMotion, m_motionLayer, cfg->motion, cfg->motionFrom);
+    if (m_useDepth)
+        pick(sDepth, m_depthLayer, cfg->depth, cfg->depthFrom);
 
-    // AOV layers: one entry per layer, never the beauty, the guides or the data passes
-    if (m_propagate && (m_ffOn || m_dfOn || m_dnOn))
+    // AOV layers: the checked ones (names or wildcards), never the beauty, the guides or data passes
+    if (m_aovList && *m_aovList && (m_ffOn || m_dfOn || m_dnOn))
     {
         ChannelSet excluded = cfg->beauty.set;
-        if (!cfg->albedoInput)
+        if (cfg->albedoFrom == sSrc)
             excluded += cfg->albedo.set;
-        if (!cfg->normalInput)
+        if (cfg->normalFrom == sSrc)
             excluded += cfg->normal.set;
-        excluded += cfg->motion.set;
-        excluded += cfg->depth.set;
-        excluded += cfg->variance.set;
+        if (cfg->motionFrom == sSrc)
+            excluded += cfg->motion.set;
+        if (cfg->depthFrom == sSrc)
+            excluded += cfg->depth.set;
         auto addLayer = [&](const std::string& layer) {
             for (const Rgb& r : cfg->aovs)
                 if (r.name == layer)
@@ -865,43 +1140,35 @@ void CleanPassIop::_validate(bool for_real)
                 cfg->aovs.push_back(r);
             }
         };
-        for (const ChannelSet& cs : m_aovLayer)
-            foreach (z, cs)
-                if (!excluded.contains(z) && srcChans.contains(z) && colourIndex(z) <= 2)
-                    addLayer(getLayerName(z));
-        // names / wildcards
-        if (m_aovPattern && *m_aovPattern)
+        std::vector<std::string> pats;
+        std::string cur;
+        for (const char* c = m_aovList;; ++c)
         {
-            std::vector<std::string> pats;
-            std::string cur;
-            for (const char* c = m_aovPattern;; ++c)
+            if (!*c || std::isspace((unsigned char)*c) || *c == ',')
             {
-                if (!*c || std::isspace((unsigned char)*c) || *c == ',')
-                {
-                    if (!cur.empty())
-                        pats.push_back(cur);
-                    cur.clear();
-                    if (!*c)
-                        break;
-                }
-                else
-                    cur += *c;
+                if (!cur.empty())
+                    pats.push_back(cur);
+                cur.clear();
+                if (!*c)
+                    break;
             }
-            std::vector<std::string> layers;
-            foreach (w, srcChans)
-            {
-                const std::string l = getLayerName(w);
-                if (std::find(layers.begin(), layers.end(), l) == layers.end())
-                    layers.push_back(l);
-            }
-            for (const std::string& l : layers)
-                for (const std::string& pat : pats)
-                    if (globMatch(pat.c_str(), l.c_str()))
-                    {
-                        addLayer(l);
-                        break;
-                    }
+            else
+                cur += *c;
         }
+        std::vector<std::string> layers;
+        foreach (w, srcChans)
+        {
+            const std::string l = getLayerName(w);
+            if (std::find(layers.begin(), layers.end(), l) == layers.end())
+                layers.push_back(l);
+        }
+        for (const std::string& l : layers)
+            for (const std::string& pat : pats)
+                if (globMatch(pat.c_str(), l.c_str()))
+                {
+                    addLayer(l);
+                    break;
+                }
     }
 
     // stage parameters
@@ -929,9 +1196,9 @@ void CleanPassIop::_validate(bool for_real)
     pp.df.tolerance = std::max(0.1f, m_dfTolerance);
     pp.df.amount = std::max(0.f, std::min(1.f, m_dfAmount));
     pp.df.useGuides = m_dfGuides;
-    pp.df.useVectors = m_dfVectors;
-    pp.df.useDepth = m_dfDepth;
-    pp.df.useVariance = m_dfVariance;
+    pp.df.useVectors = m_useVectors;
+    pp.df.useDepth = m_useDepth;
+    pp.df.useVariance = false;
     pp.denoise = m_dnOn;
     pp.denoiseAmount = std::max(0.f, std::min(1.f, m_dnAmount));
     pp.stabilize = m_stabilize;
@@ -949,7 +1216,7 @@ void CleanPassIop::_validate(bool for_real)
     cfg->mix = std::max(0.f, std::min(1.f, m_mix));
     cfg->outputMatte = m_outputMatte && m_matteChannel != Chan_Black;
     cfg->matteChannel = m_matteChannel;
-    cfg->copies = std::min(actualCopies(), 1 + 2 * temporalRadius());
+    cfg->copies = std::min(copiesOf(0), 1 + 2 * temporalRadius());
 
     if (cfg->outputMatte)
         info_.turn_on(cfg->matteChannel);
@@ -981,29 +1248,28 @@ void CleanPassIop::getRequests(const Box& box, const ChannelSet& channels, int c
     std::shared_ptr<const Config> cfg = config();
     if (!cfg || !cfg->active() || cfg->box.w() <= 0 || cfg->box.h() <= 0)
         return;
+    // from src (every copy the stages read): the beauty, the AOVs and the
+    // guides that are layers of src
     ChannelSet need = cfg->beauty.set;
-    if (!cfg->albedoInput)
-        need += cfg->albedo.set;
-    if (!cfg->normalInput)
-        need += cfg->normal.set;
     for (const Rgb& r : cfg->aovs)
         need += r.set;
-    need += cfg->motion.set;
-    need += cfg->depth.set;
-    need += cfg->variance.set;
+    const std::pair<const Rgb*, int> guides[] = {{&cfg->albedo, cfg->albedoFrom}, {&cfg->normal, cfg->normalFrom},
+                                                 {&cfg->motion, cfg->motionFrom}, {&cfg->depth, cfg->depthFrom}};
+    for (const auto& g : guides)
+        if (g.second == sSrc)
+            need += g.first->set;
     req.request(src, clip(cfg->box, src), need, count);
     for (int o = 1; o < cfg->copies; ++o)
-        if (Iop* t = in(0, o))
+        if (Iop* t = in(sSrc, o))
             req.request(t, clip(cfg->box, t), need, count);
-
-    if (cfg->albedoInput)
-        if (Iop* a = in(1))
-            req.request(a, clip(cfg->box, a), Mask_RGB, count);
-    if (cfg->normalInput)
-        if (Iop* n = in(2))
-            req.request(n, clip(cfg->box, n), Mask_RGB, count);
+    // guides from their own inputs, at the same frames
+    for (const auto& g : guides)
+        if (g.second != sSrc && g.first->valid())
+            for (int o = 0; o < cfg->copies; ++o)
+                if (Iop* t = in(g.second, o))
+                    req.request(t, clip(cfg->box, t), g.first->set, count);
     if (cfg->maskInput)
-        if (Iop* m = in(3))
+        if (Iop* m = in(sMask))
             req.request(m, clip(cfg->box, m), ChannelSet(cfg->maskChannel), count);
 }
 
@@ -1017,18 +1283,19 @@ Hash CleanPassIop::analysisKey(const Config& cfg) const
     // so that those can be changed without recomputing anything.
     Hash h;
     h.append(outputContext().frame()); // some ops keep one hash on every frame
-    for (int n = 0; n < 4; ++n)
+    for (int slot = 0; slot < sSlotCount; ++slot)
     {
-        const bool c = (n == 0) || (n == 1 && cfg.albedoInput) || (n == 2 && cfg.normalInput) ||
-                       (n == 3 && cfg.maskInput);
+        const bool c = slot == sSrc || (slot == sMask ? cfg.maskInput
+                                                      : ((slot == sAlbedo && cfg.albedoFrom == sAlbedo) ||
+                                                         (slot == sNormal && cfg.normalFrom == sNormal) ||
+                                                         (slot == sMotion && cfg.motionFrom == sMotion) ||
+                                                         (slot == sDepth && cfg.depthFrom == sDepth)));
         h.append(c);
         if (c)
-            if (Iop* i = in(n))
-                h.append(i->hash());
+            for (int o = 0; o < (slot == sMask ? 1 : cfg.copies); ++o)
+                if (Iop* t = in(slot, o))
+                    h.append(t->hash());
     }
-    for (int o = 1; o < cfg.copies; ++o)
-        if (Iop* t = in(0, o))
-            h.append(t->hash());
     h.append(settingsKey(cfg));
     return h;
 }
@@ -1053,7 +1320,8 @@ Hash CleanPassIop::settingsKey(const Config& cfg) const
     h.append(cfg.oidn.device); h.append(cfg.oidn.quality); h.append(cfg.oidn.prefilterAux);
     h.append(cfg.oidn.maxMemoryMB);
     h.append((int)cfg.maskChannel); h.append(cfg.invertMask);
-    for (const Rgb* r : {&cfg.beauty, &cfg.albedo, &cfg.normal, &cfg.motion, &cfg.depth, &cfg.variance})
+    h.append(cfg.albedoFrom); h.append(cfg.normalFrom); h.append(cfg.motionFrom); h.append(cfg.depthFrom);
+    for (const Rgb* r : {&cfg.beauty, &cfg.albedo, &cfg.normal, &cfg.motion, &cfg.depth})
         for (int c = 0; c < 3; ++c)
             h.append((int)r->ch[c]);
     for (const Rgb& r : cfg.aovs)
@@ -1155,57 +1423,46 @@ std::shared_ptr<CleanPassIop::Result> CleanPassIop::computeAnalysis(const Config
     inp.height = box.h();
 
     // current frame
-    std::vector<float> beauty, albedo, normal, mask, motion, depth, variance;
+    std::vector<float> beauty, albedo, normal, mask, motion, depth;
     fetchDense(src, box, cfg.beauty.ch, beauty);
     inp.cur.beauty = viewOf(beauty, box);
     if (cfg.albedo.valid())
     {
-        fetchDense(cfg.albedoInput ? in(1) : src, box, cfg.albedo.ch, albedo);
+        fetchDense(in(cfg.albedoFrom), box, cfg.albedo.ch, albedo);
         inp.cur.albedo = viewOf(albedo, box);
     }
     if (cfg.normal.valid())
     {
-        fetchDense(cfg.normalInput ? in(2) : src, box, cfg.normal.ch, normal);
+        fetchDense(in(cfg.normalFrom), box, cfg.normal.ch, normal);
         inp.cur.normal = viewOf(normal, box);
     }
     const bool useMotion = temporalMotion && pp.df.useVectors && cfg.motion.valid();
     const bool useDepth = temporalMotion && pp.df.useDepth && cfg.depth.valid();
-    const bool useVariance = temporalMotion && pp.df.useVariance && cfg.variance.valid();
     if (useMotion)
     {
-        fetchDense(src, box, cfg.motion.ch, motion);
+        fetchDense(in(cfg.motionFrom), box, cfg.motion.ch, motion);
         inp.cur.motion = viewOf(motion, box);
     }
     if (useDepth)
     {
-        fetchDense(src, box, cfg.depth.ch, depth);
+        fetchDense(in(cfg.depthFrom), box, cfg.depth.ch, depth);
         inp.cur.depth = viewOf(depth, box);
-    }
-    if (useVariance)
-    {
-        fetchDense(src, box, cfg.variance.ch, variance);
-        inp.cur.variance = viewOf(variance, box);
     }
     if (stop())
         return res;
 
     // neighbour frames
     const int need = std::max({pp.firefly && pp.ff.temporal ? 1 : 0, pp.deflicker ? pp.df.frames : 0, stab ? 2 : 0});
-    const bool guidesFromSrc = ((temporalMotion && pp.df.useGuides) || stab) && !cfg.albedoInput &&
-                               !cfg.normalInput && cfg.albedo.valid() && cfg.normal.valid();
-    // The stabilisation denoises t-1 / t+1 too: it needs their guides, which a
-    // separate albedo / normal input only gives at frame t.
-    cleanpass::PipelineParams runP = pp;
-    if (stab && (cfg.albedoInput || cfg.normalInput))
-        runP.stabilize = false;
-    std::vector<std::vector<float>> nbBeauty(5), nbAlb(5), nbNrm(5), nbMot(5), nbDep(5), nbVar(5);
-    Iop* t0 = in(0, 0);
+    const bool wantGuides = ((temporalMotion && pp.df.useGuides) || stab) && cfg.albedo.valid() && cfg.normal.valid();
+    const cleanpass::PipelineParams runP = pp;
+    std::vector<std::vector<float>> nbBeauty(5), nbAlb(5), nbNrm(5), nbMot(5), nbDep(5);
+    Iop* t0 = in(sSrc, 0);
     for (int o = 1; o < cfg.copies; ++o)
     {
         const int off = offsetOfCopy(o);
         if (std::abs(off) > need)
             continue;
-        Iop* t = in(0, o);
+        Iop* t = in(sSrc, o);
         if (!t || !t0)
             continue;
         fetchDense(t, box, cfg.beauty.ch, nbBeauty[o]);
@@ -1222,33 +1479,30 @@ std::shared_ptr<CleanPassIop::Result> CleanPassIop::computeAnalysis(const Config
         cleanpass::PipelineFrame fr;
         fr.offset = off;
         fr.beauty = viewOf(nbBeauty[o], box);
-        if (guidesFromSrc)
+        // the guides of that frame: from src or from their own inputs, both or none
+        Iop* ta = in(cfg.albedoFrom, o);
+        Iop* tn = in(cfg.normalFrom, o);
+        if (wantGuides && ta && tn)
         {
-            fetchDense(t, box, cfg.albedo.ch, nbAlb[o]);
-            fetchDense(t, box, cfg.normal.ch, nbNrm[o]);
+            fetchDense(ta, box, cfg.albedo.ch, nbAlb[o]);
+            fetchDense(tn, box, cfg.normal.ch, nbNrm[o]);
             fr.albedo = viewOf(nbAlb[o], box);
             fr.normal = viewOf(nbNrm[o], box);
         }
         if (useDepth)
-        {
-            fetchDense(t, box, cfg.depth.ch, nbDep[o]);
-            fr.depth = viewOf(nbDep[o], box);
-        }
-        // t-1 / t+1 are processed on their own by the stabilisation: their own
-        // vectors and variance are needed then
-        if (stab && std::abs(off) == 1)
-        {
-            if (useMotion)
+            if (Iop* td = in(cfg.depthFrom, o))
             {
-                fetchDense(t, box, cfg.motion.ch, nbMot[o]);
+                fetchDense(td, box, cfg.depth.ch, nbDep[o]);
+                fr.depth = viewOf(nbDep[o], box);
+            }
+        // t-1 / t+1 are processed on their own by the stabilisation: their own
+        // vectors are needed then
+        if (stab && std::abs(off) == 1 && useMotion)
+            if (Iop* tm = in(cfg.motionFrom, o))
+            {
+                fetchDense(tm, box, cfg.motion.ch, nbMot[o]);
                 fr.motion = viewOf(nbMot[o], box);
             }
-            if (useVariance)
-            {
-                fetchDense(t, box, cfg.variance.ch, nbVar[o]);
-                fr.variance = viewOf(nbVar[o], box);
-            }
-        }
         inp.neighbours.push_back(fr);
         res->nbCopy.push_back(o);
         if (stop())
@@ -1257,7 +1511,7 @@ std::shared_ptr<CleanPassIop::Result> CleanPassIop::computeAnalysis(const Config
 
     // global mask (applied at output, to every stage)
     if (cfg.maskInput)
-        if (Iop* mi = in(3))
+        if (Iop* mi = in(sMask))
         {
             const Channel mc[3] = {cfg.maskChannel, Chan_Black, Chan_Black};
             fetchDense(mi, box, mc, mask);
@@ -1276,8 +1530,11 @@ std::shared_ptr<CleanPassIop::Result> CleanPassIop::computeAnalysis(const Config
     // stabilisation: denoised results of t-1 / t+1 already computed (when
     // playing or rendering in order, frame t+1's own result is one of them)
     auto copyHash = [&](int o) {
-        Iop* t = in(0, o);
-        return t ? t->hash() : Hash();
+        Hash h;
+        for (int slot : {(int)sSrc, cfg.albedoFrom, cfg.normalFrom, cfg.motionFrom, cfg.depthFrom})
+            if (Iop* t = in(slot, o))
+                h.append(t->hash());
+        return h;
     };
     auto denoisedKey = [&](int center, int minus, int plus) {
         Hash h;
@@ -1395,8 +1652,6 @@ std::shared_ptr<CleanPassIop::Result> CleanPassIop::computeAnalysis(const Config
             std::cerr << " [vectors ignored: they do not match the image]";
         if (D.fixedSeed)
             std::cerr << " [fixed render seed detected]";
-        if (D.varianceUsed)
-            std::cerr << " [variance]";
         if (D.depthUsed)
             std::cerr << " [depth]";
     }
