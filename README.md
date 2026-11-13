@@ -151,7 +151,9 @@ The algorithms (`src/cp_core`, `src/cp_deflicker`, `src/cp_pipeline`) have no Nu
 
 ## Credits
 
-Created by **Gabin Vidal** — <https://www.linkedin.com/in/gabinvidal>. The one-build-per-Nuke-version layout follows the approach of [NukeCGDenoiser](https://github.com/mateuszwojt/NukeCGDenoiser) by Mateusz Wojt. Uses [Intel Open Image Denoise](https://github.com/RenderKit/oidn) 2.5.1 (Apache 2.0); see `THIRD_PARTY_NOTICES.md`.
+Created by **Gabin Vidal** — <https://www.linkedin.com/in/gabinvidal>.
+
+CleanPass builds on [NukeCGDenoiser](https://github.com/JTCHE/NukeCGDenoiser) by John Chedeville, itself a fork of [NukeCGDenoiser](https://github.com/mateuszwojt/NukeCGDenoiser) by Mateusz Wojt (both MIT). Uses [Intel Open Image Denoise](https://github.com/RenderKit/oidn) 2.5.1 (Apache 2.0); see `THIRD_PARTY_NOTICES.md`.
 
 ## License
 
@@ -226,6 +228,12 @@ Inputs : **src** (le rendu), **albedo**, **normal** et **mask**, plus **motion**
 - Windows uniquement pour l'instant.
 
 Les mesures de validation détaillées sont dans la [version anglaise](#how-it-works-and-validation).
+
+## Crédits
+
+Créé par **Gabin Vidal** — <https://www.linkedin.com/in/gabinvidal>.
+
+CleanPass s'appuie sur [NukeCGDenoiser](https://github.com/JTCHE/NukeCGDenoiser) de John Chedeville, lui-même un fork de [NukeCGDenoiser](https://github.com/mateuszwojt/NukeCGDenoiser) de Mateusz Wojt (tous deux sous MIT). Utilise [Intel Open Image Denoise](https://github.com/RenderKit/oidn) 2.5.1 (Apache 2.0) ; voir `THIRD_PARTY_NOTICES.md`.
 
 ## Licence
 

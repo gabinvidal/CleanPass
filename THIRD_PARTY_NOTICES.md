@@ -18,3 +18,9 @@ Visual C++ Redistributable licence terms.
 The full licence texts and third-party notices are in `oidn/` (copied from the
 OIDN SDK by `build.ps1`). Nuke and the Nuke NDK are © The Foundry and are not
 redistributed.
+
+## NukeCGDenoiser
+
+CleanPass builds on [NukeCGDenoiser](https://github.com/JTCHE/NukeCGDenoiser) by John Chedeville, a fork of
+[NukeCGDenoiser](https://github.com/mateuszwojt/NukeCGDenoiser) by Mateusz Wojt, MIT License:
+Copyright (c) 2021-2024 Mateusz Wojt, Copyright (c) 2026 John Chedeville. Their copyright notices are kept in `LICENSE`.
